@@ -1,6 +1,26 @@
 # AI Video Generator
 
-A full-stack web application that converts text prompts or image uploads into AI-generated videos. Built with React, FastAPI, and MongoDB.
+A full-stack web application that converts text prompts or image uploads into AI-generated videos. Built with React, FastAPI, and MongoDB, with video generation by [Runway](https://dev.runwayml.com).
+
+## ⚡ Quick start
+
+Needs Python 3.9+, Node 16+ and Yarn. MongoDB is optional.
+
+```bash
+npm install            # one-time: helper tools
+npm run install-all    # one-time: backend + frontend dependencies
+npm run setup          # one-time: creates backend/.env and frontend/.env
+npm run app            # builds the frontend and serves the whole app
+```
+
+Open http://localhost:8001.
+
+- **Demo mode (default):** with no `RUNWAY_API_KEY`, generation returns sample media so you can try the app.
+- **Real videos:** put your key in `backend/.env` as `RUNWAY_API_KEY=...` and restart. Runway jobs take about 1–3 minutes and use your Runway credits. The model and aspect ratio are set by `RUNWAY_TEXT_MODEL`, `RUNWAY_IMAGE_MODEL` and `RUNWAY_RATIO` (default `gen4.5`, `1280:720`).
+- **Database:** leave `MONGO_URL` empty to use a built-in in-memory store (cleared on restart), or set it to a MongoDB URL to keep videos.
+- **Development:** `npm run dev` runs the backend (:8001) and the frontend with hot reload (:3000).
+- **Tests:** start the backend, then run `npm test`.
+- `GET /api/runway/status` shows whether the server is in `runway` or `demo` mode.
 
 ## 🚀 Features
 

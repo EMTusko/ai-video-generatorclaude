@@ -6,12 +6,17 @@ import json
 from io import BytesIO
 from PIL import Image
 
-# Get the backend URL from the frontend .env file
-with open('/app/frontend/.env', 'r') as f:
-    for line in f:
-        if line.startswith('REACT_APP_BACKEND_URL='):
-            BACKEND_URL = line.strip().split('=')[1].strip('"\'')
-            break
+# Backend URL: BACKEND_URL env var, else REACT_APP_BACKEND_URL from frontend/.env,
+# else the default local dev server.
+BACKEND_URL = os.environ.get("BACKEND_URL", "")
+_frontend_env = os.path.join(os.path.dirname(os.path.abspath(__file__)), "frontend", ".env")
+if not BACKEND_URL and os.path.exists(_frontend_env):
+    with open(_frontend_env) as f:
+        for line in f:
+            if line.startswith('REACT_APP_BACKEND_URL='):
+                BACKEND_URL = line.strip().split('=', 1)[1].strip('"\'')
+                break
+BACKEND_URL = (BACKEND_URL or "http://localhost:8001").rstrip("/")
 
 API_URL = f"{BACKEND_URL}/api"
 

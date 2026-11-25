@@ -3,3 +3,5 @@ python-dotenv
 motor
 aiohttp
 uvicorn
+runwayml
+mongomock-motor

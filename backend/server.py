@@ -1,48 +1,61 @@
 from fastapi import FastAPI, APIRouter, File, UploadFile, HTTPException, Form
-from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
 from pathlib import Path
 from pydantic import BaseModel, Field
 from typing import List, Optional
 import uuid
-from datetime import datetime
-import shutil
+from datetime import datetime, timezone
 import asyncio
 import random
-from api_runway import router as runway_router
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-# MongoDB connection
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+import api_runway  # noqa: E402  (reads env vars loaded above)
 
-# Create the main app without a prefix
-app = FastAPI()
-app.include_router(runway_router, prefix="/api/runway")
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-# Create a router with the /api prefix
+# Database: MongoDB when MONGO_URL is set, otherwise an in-memory store
+# (data is lost on restart, but the app runs with no setup).
+mongo_url = os.environ.get('MONGO_URL', '')
+if mongo_url and not mongo_url.startswith('memory'):
+    from motor.motor_asyncio import AsyncIOMotorClient
+    client = AsyncIOMotorClient(mongo_url)
+    logger.info("Using MongoDB at %s", mongo_url.split('@')[-1])
+else:
+    from mongomock_motor import AsyncMongoMockClient
+    client = AsyncMongoMockClient()
+    logger.warning("MONGO_URL not set: using an in-memory database (data is lost on restart)")
+db = client[os.environ.get('DB_NAME', 'ai_video_generator')]
+
+app = FastAPI(title="AI Video Generator")
+app.include_router(api_runway.router, prefix="/api/runway")
+
 api_router = APIRouter(prefix="/api")
 
-# Create uploads directory
 uploads_dir = ROOT_DIR / "uploads"
 uploads_dir.mkdir(exist_ok=True)
 
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+TEXT_STYLES = {"realistic", "anime", "cartoon", "surreal", "talking_image"}
+IMAGE_STYLES = {"character_animation", "movement_overlay", "talking_face"}
+
+# Keep references so background tasks are not garbage-collected mid-run.
+_background_tasks = set()
+
+
 # Models
 class VideoGenerationRequest(BaseModel):
-    prompt: str
+    prompt: str = Field(min_length=1, max_length=1000)
     style: str  # realistic, anime, cartoon, surreal, talking_image
-    duration: int = Field(default=7, ge=5, le=10)
-    nsfw_enabled: bool = Field(default=False)
-
-class ImageToVideoRequest(BaseModel):
-    style: str  # character_animation, movement_overlay, talking_face
     duration: int = Field(default=7, ge=5, le=10)
     nsfw_enabled: bool = Field(default=False)
 
@@ -55,6 +68,8 @@ class VideoResponse(BaseModel):
     status: str  # generating, completed, failed
     video_url: Optional[str] = None
     thumbnail_url: Optional[str] = None
+    error: Optional[str] = None
+    mode: str = "demo"  # runway or demo
     created_at: datetime
     nsfw_enabled: bool = Field(default=False)
 
@@ -118,84 +133,88 @@ SAMPLE_VIDEOS = {
     ]
 }
 
-async def simulate_video_generation(video_id: str, style: str):
-    """Simulate video generation process"""
-    await asyncio.sleep(3)  # Simulate processing time
-    
-    # Update video status to completed with sample content
-    sample_content = random.choice(SAMPLE_VIDEOS.get(style, SAMPLE_VIDEOS["realistic"]))
-    
-    await db.videos.update_one(
-        {"id": video_id},
-        {
-            "$set": {
-                "status": "completed",
-                "video_url": sample_content["video_url"],
-                "thumbnail_url": sample_content["thumbnail_url"]
-            }
-        }
-    )
+
+async def run_generation(video_id: str, style: str, prompt: Optional[str],
+                         duration: int, image_uri: Optional[str] = None):
+    """Generate the video in the background and store the result."""
+    try:
+        if api_runway.is_enabled():
+            video_url = await api_runway.generate_video(prompt, style, duration, image_uri)
+            update = {"status": "completed", "video_url": video_url, "thumbnail_url": None}
+        else:
+            await asyncio.sleep(3)  # demo mode: pretend to work, return sample media
+            sample = random.choice(SAMPLE_VIDEOS.get(style, SAMPLE_VIDEOS["realistic"]))
+            update = {"status": "completed", **sample}
+    except Exception as exc:  # noqa: BLE001 - surface any provider error to the user
+        logger.exception("Video %s failed", video_id)
+        update = {"status": "failed", "error": str(exc)[:500]}
+    await db.videos.update_one({"id": video_id}, {"$set": update})
+
+
+def start_generation(*args):
+    task = asyncio.create_task(run_generation(*args))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+def new_video_record(video_id: str, style: str, duration: int, nsfw_enabled: bool, **extra):
+    return {
+        "id": video_id,
+        "style": style,
+        "duration": duration,
+        "status": "generating",
+        "mode": "runway" if api_runway.is_enabled() else "demo",
+        "created_at": datetime.now(timezone.utc),
+        "nsfw_enabled": nsfw_enabled,
+        **extra,
+    }
+
 
 @api_router.post("/generate-text-to-video", response_model=VideoResponse)
 async def generate_text_to_video(request: VideoGenerationRequest):
     """Generate video from text prompt"""
+    if request.style not in TEXT_STYLES:
+        raise HTTPException(status_code=400, detail=f"Unknown style '{request.style}'")
     video_id = str(uuid.uuid4())
-    
-    video_data = {
-        "id": video_id,
-        "prompt": request.prompt,
-        "style": request.style,
-        "duration": request.duration,
-        "status": "generating",
-        "created_at": datetime.utcnow(),
-        "nsfw_enabled": request.nsfw_enabled
-    }
-    
-    # Save to database
-    await db.videos.insert_one(video_data)
-    
-    # Start background video generation
-    asyncio.create_task(simulate_video_generation(video_id, request.style))
-    
+    video_data = new_video_record(video_id, request.style, request.duration,
+                                  request.nsfw_enabled, prompt=request.prompt)
+    await db.videos.insert_one(dict(video_data))
+    start_generation(video_id, request.style, request.prompt, request.duration)
     return VideoResponse(**video_data)
 
-@api_router.post("/generate-image-to-video")
+
+@api_router.post("/generate-image-to-video", response_model=VideoResponse)
 async def generate_image_to_video(
     file: UploadFile = File(...),
     style: str = Form(...),
     duration: int = Form(7),
-    nsfw_enabled: bool = Form(False)
+    nsfw_enabled: bool = Form(False),
+    prompt: Optional[str] = Form(None),
 ):
     """Generate video from uploaded image"""
-    if not file.content_type.startswith('image/'):
+    if not (file.content_type or '').startswith('image/'):
         raise HTTPException(status_code=400, detail="File must be an image")
-    
+    if style not in IMAGE_STYLES:
+        raise HTTPException(status_code=400, detail=f"Unknown style '{style}'")
+    if not 5 <= duration <= 10:
+        raise HTTPException(status_code=400, detail="Duration must be 5-10 seconds")
+
+    data = await file.read()
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Image must be 10 MB or smaller")
+
     video_id = str(uuid.uuid4())
-    
-    # Save uploaded file
-    file_extension = file.filename.split('.')[-1] if '.' in file.filename else 'jpg'
-    filename = f"{video_id}.{file_extension}"
-    file_path = uploads_dir / filename
-    
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-    
-    video_data = {
-        "id": video_id,
-        "image_filename": filename,
-        "style": style,
-        "duration": duration,
-        "status": "generating",
-        "created_at": datetime.utcnow(),
-        "nsfw_enabled": nsfw_enabled
-    }
-    
-    # Save to database
-    await db.videos.insert_one(video_data)
-    
-    # Start background video generation
-    asyncio.create_task(simulate_video_generation(video_id, style))
-    
+    ext = Path(file.filename or '').suffix.lstrip('.').lower()
+    if ext not in {"jpg", "jpeg", "png", "gif", "webp"}:
+        ext = "jpg"
+    filename = f"{video_id}.{ext}"
+    (uploads_dir / filename).write_bytes(data)
+
+    video_data = new_video_record(video_id, style, duration, nsfw_enabled,
+                                  image_filename=filename, prompt=prompt)
+    await db.videos.insert_one(dict(video_data))
+    image_uri = api_runway.image_data_uri(data, file.content_type)
+    start_generation(video_id, style, prompt, duration, image_uri)
     return VideoResponse(**video_data)
 
 @api_router.get("/video/{video_id}", response_model=VideoResponse)
@@ -238,20 +257,23 @@ async def get_available_styles():
 # Include the router in the main app
 app.include_router(api_router)
 
+app.mount("/uploads", StaticFiles(directory=uploads_dir), name="uploads")
+
+allowed_origins = [o.strip() for o in os.environ.get('ALLOWED_ORIGINS', '*').split(',') if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_credentials=True,
-    allow_origins=["*"],
+    allow_credentials=allowed_origins != ['*'],
+    allow_origins=allowed_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+# Serve the built React app from the same server when it exists
+# (run `yarn build` in frontend/), so the whole app is on one port.
+frontend_build = ROOT_DIR.parent / "frontend" / "build"
+if frontend_build.is_dir():
+    app.mount("/", StaticFiles(directory=frontend_build, html=True), name="frontend")
+
 
 @app.on_event("shutdown")
 async def shutdown_db_client():

@@ -2,8 +2,21 @@ import React, { useState, useEffect } from 'react';
 import axios from 'axios';
 import './App.css';
 
-const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
+// Empty means "same server" (the backend serves the built frontend).
+const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || '';
 const API = `${BACKEND_URL}/api`;
+
+const isVideoUrl = (url) => /\.(mp4|webm|mov)(\?|$)/i.test(url || '') || /runway|cloudfront/i.test(url || '');
+
+// Real Runway results are videos; demo mode returns sample images.
+const Media = ({ item, className }) => {
+  const url = item.video_url || item.thumbnail_url;
+  if (!url) return null;
+  if (item.mode === 'runway' || isVideoUrl(url)) {
+    return <video src={item.video_url} className={className} controls loop muted playsInline />;
+  }
+  return <img src={item.thumbnail_url || item.video_url} alt="Generated" className={className} />;
+};
 
 const VideoGeneratorApp = () => {
   const [activeTab, setActiveTab] = useState('text');
@@ -18,11 +31,47 @@ const VideoGeneratorApp = () => {
   const [duration, setDuration] = useState(7);
   const [nsfwEnabled, setNsfwEnabled] = useState(false);
   const [showGallery, setShowGallery] = useState(false);
+  const [imagePrompt, setImagePrompt] = useState('');
+  const [mode, setMode] = useState(null);
+  const [errorMessage, setErrorMessage] = useState('');
 
   useEffect(() => {
     loadStyles();
     loadVideoGallery();
+    axios.get(`${API}/runway/status`).then((r) => setMode(r.data.mode)).catch(() => setMode(null));
   }, []);
+
+  // Poll a video until it finishes. Runway jobs can take a few minutes.
+  const pollVideo = (videoId) => {
+    const checkVideo = async () => {
+      try {
+        const { data } = await axios.get(`${API}/video/${videoId}`);
+        if (data.status === 'completed') {
+          setGeneratedVideo(data);
+          setIsGenerating(false);
+          loadVideoGallery();
+        } else if (data.status === 'failed') {
+          setIsGenerating(false);
+          setErrorMessage(data.error || 'Video generation failed. Please try again.');
+          loadVideoGallery();
+        } else {
+          setTimeout(checkVideo, 3000);
+        }
+      } catch (error) {
+        console.error('Error checking video status:', error);
+        setErrorMessage('Lost connection to the server while checking the video.');
+        setIsGenerating(false);
+      }
+    };
+    setTimeout(checkVideo, 1000);
+  };
+
+  const requestError = (error) => {
+    console.error('Error generating video:', error);
+    const detail = error.response?.data?.detail;
+    setErrorMessage(typeof detail === 'string' ? detail : 'Could not start generation. Is the backend running?');
+    setIsGenerating(false);
+  };
 
   const loadStyles = async () => {
     try {
@@ -53,6 +102,7 @@ const VideoGeneratorApp = () => {
     if (!textPrompt.trim()) return;
     
     setIsGenerating(true);
+    setErrorMessage('');
     try {
       const response = await axios.post(`${API}/generate-text-to-video`, {
         prompt: textPrompt,
@@ -61,32 +111,9 @@ const VideoGeneratorApp = () => {
         nsfw_enabled: nsfwEnabled
       });
       
-      const videoId = response.data.id;
-      
-      // Poll for video completion
-      const checkVideo = async () => {
-        try {
-          const videoResponse = await axios.get(`${API}/video/${videoId}`);
-          if (videoResponse.data.status === 'completed') {
-            setGeneratedVideo(videoResponse.data);
-            setIsGenerating(false);
-            loadVideoGallery();
-          } else if (videoResponse.data.status === 'failed') {
-            setIsGenerating(false);
-            alert('Video generation failed. Please try again.');
-          } else {
-            setTimeout(checkVideo, 2000);
-          }
-        } catch (error) {
-          console.error('Error checking video status:', error);
-          setIsGenerating(false);
-        }
-      };
-      
-      setTimeout(checkVideo, 1000);
+      pollVideo(response.data.id);
     } catch (error) {
-      console.error('Error generating video:', error);
-      setIsGenerating(false);
+      requestError(error);
     }
   };
 
@@ -94,11 +121,13 @@ const VideoGeneratorApp = () => {
     if (!uploadedImage) return;
     
     setIsGenerating(true);
+    setErrorMessage('');
     const formData = new FormData();
     formData.append('file', uploadedImage);
     formData.append('style', selectedImageStyle);
     formData.append('duration', duration);
     formData.append('nsfw_enabled', nsfwEnabled);
+    if (imagePrompt.trim()) formData.append('prompt', imagePrompt.trim());
     
     try {
       const response = await axios.post(`${API}/generate-image-to-video`, formData, {
@@ -107,32 +136,9 @@ const VideoGeneratorApp = () => {
         }
       });
       
-      const videoId = response.data.id;
-      
-      // Poll for video completion
-      const checkVideo = async () => {
-        try {
-          const videoResponse = await axios.get(`${API}/video/${videoId}`);
-          if (videoResponse.data.status === 'completed') {
-            setGeneratedVideo(videoResponse.data);
-            setIsGenerating(false);
-            loadVideoGallery();
-          } else if (videoResponse.data.status === 'failed') {
-            setIsGenerating(false);
-            alert('Video generation failed. Please try again.');
-          } else {
-            setTimeout(checkVideo, 2000);
-          }
-        } catch (error) {
-          console.error('Error checking video status:', error);
-          setIsGenerating(false);
-        }
-      };
-      
-      setTimeout(checkVideo, 1000);
+      pollVideo(response.data.id);
     } catch (error) {
-      console.error('Error generating video:', error);
-      setIsGenerating(false);
+      requestError(error);
     }
   };
 
@@ -250,6 +256,19 @@ const VideoGeneratorApp = () => {
 
                   <div>
                     <label className="block text-sm font-medium mb-2">
+                      Describe the motion (optional)
+                    </label>
+                    <input
+                      type="text"
+                      value={imagePrompt}
+                      onChange={(e) => setImagePrompt(e.target.value)}
+                      placeholder="She turns and smiles at the camera..."
+                      className="w-full px-4 py-3 bg-gray-800 border border-gray-700 rounded-lg focus:ring-2 focus:ring-purple-500"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-medium mb-2">
                       Animation Style
                     </label>
                     <select
@@ -311,6 +330,21 @@ const VideoGeneratorApp = () => {
                   'Generate Video'
                 )}
               </button>
+
+              {errorMessage && (
+                <div className="p-4 bg-red-900 border border-red-700 rounded-lg text-sm text-red-100">
+                  {errorMessage}
+                </div>
+              )}
+
+              {mode === 'demo' && (
+                <div className="p-4 bg-gray-800 border border-yellow-700 rounded-lg text-sm text-yellow-300">
+                  Demo mode: results are sample media. Set RUNWAY_API_KEY in backend/.env to generate real videos.
+                </div>
+              )}
+              {isGenerating && mode === 'runway' && (
+                <div className="text-sm text-gray-400 text-center">Runway videos usually take 1–3 minutes.</div>
+              )}
             </div>
 
             {/* Preview Panel */}
@@ -320,11 +354,7 @@ const VideoGeneratorApp = () => {
               {generatedVideo ? (
                 <div className="bg-gray-800 rounded-lg p-6 space-y-4">
                   <div className="aspect-video bg-gray-700 rounded-lg overflow-hidden">
-                    <img
-                      src={generatedVideo.thumbnail_url || generatedVideo.video_url}
-                      alt="Generated video"
-                      className="w-full h-full object-cover"
-                    />
+                    <Media item={generatedVideo} className="w-full h-full object-cover" />
                   </div>
                   
                   <div className="space-y-2">
@@ -340,11 +370,20 @@ const VideoGeneratorApp = () => {
                     )}
                     
                     <div className="flex space-x-2 pt-2">
-                      <button className="flex-1 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors">
+                      <a
+                        href={generatedVideo.video_url}
+                        target="_blank"
+                        rel="noreferrer"
+                        download
+                        className="flex-1 py-2 text-center bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors"
+                      >
                         Download
-                      </button>
-                      <button className="flex-1 py-2 bg-gray-600 hover:bg-gray-700 rounded-lg transition-colors">
-                        Share
+                      </a>
+                      <button
+                        onClick={() => navigator.clipboard?.writeText(generatedVideo.video_url)}
+                        className="flex-1 py-2 bg-gray-600 hover:bg-gray-700 rounded-lg transition-colors"
+                      >
+                        Copy link
                       </button>
                     </div>
                   </div>
@@ -378,11 +417,13 @@ const VideoGeneratorApp = () => {
                 {videoGallery.map((video) => (
                   <div key={video.id} className="bg-gray-800 rounded-lg overflow-hidden">
                     <div className="aspect-video bg-gray-700">
-                      <img
-                        src={video.thumbnail_url || video.video_url}
-                        alt="Video thumbnail"
-                        className="w-full h-full object-cover"
-                      />
+                      {video.status === 'completed' ? (
+                        <Media item={video} className="w-full h-full object-cover" />
+                      ) : (
+                        <div className="w-full h-full flex items-center justify-center text-sm text-gray-400">
+                          {video.status === 'failed' ? 'Failed' : 'Generating…'}
+                        </div>
+                      )}
                     </div>
                     <div className="p-4 space-y-2">
                       <div className="flex items-center justify-between">

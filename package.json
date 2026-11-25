@@ -10,9 +10,10 @@
     "backend": "cd backend && uvicorn server:app --host 0.0.0.0 --port 8001 --reload",
     "frontend": "cd frontend && yarn start",
     "build": "cd frontend && yarn build",
-    "test": "cd backend && python backend_test.py && cd ../frontend && yarn test",
+    "test": "python -m pytest backend_test.py",
     "deploy": "npm run build && echo 'Ready for deployment'",
-    "setup": "cp backend/.env.example backend/.env && cp frontend/.env.example frontend/.env && echo 'Environment files created. Please edit them with your configuration.'"
+    "setup": "cp -n backend/.env.example backend/.env; cp -n frontend/.env.example frontend/.env; echo 'Created backend/.env and frontend/.env. Add RUNWAY_API_KEY to backend/.env for real videos.'",
+    "app": "cd frontend && yarn build && cd ../backend && uvicorn server:app --host 0.0.0.0 --port 8001"
   },
   "repository": {
     "type": "git",
